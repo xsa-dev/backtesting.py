@@ -1,9 +1,26 @@
+from __future__ import annotations
+
+import os
+import sys
 import warnings
+from contextlib import contextmanager
+from functools import partial
+from itertools import chain
+from multiprocessing import resource_tracker as _mprt
+from multiprocessing import shared_memory as _mpshm
 from numbers import Number
+from threading import Lock
 from typing import Dict, List, Optional, Sequence, Union, cast
 
 import numpy as np
 import pandas as pd
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _tqdm = partial(_tqdm, leave=False)
+except ImportError:
+    def _tqdm(seq, **_):
+        return seq
 
 
 def try_(lazy_func, default=None, exception=Exception):
@@ -11,6 +28,20 @@ def try_(lazy_func, default=None, exception=Exception):
         return lazy_func()
     except exception:
         return default
+
+
+@contextmanager
+def patch(obj, attr, newvalue):
+    had_attr = hasattr(obj, attr)
+    orig_value = getattr(obj, attr, None)
+    setattr(obj, attr, newvalue)
+    try:
+        yield
+    finally:
+        if had_attr:
+            setattr(obj, attr, orig_value)
+        else:
+            delattr(obj, attr)
 
 
 def _as_str(value) -> str:
@@ -34,10 +65,32 @@ def _as_list(value) -> List:
     return [value]
 
 
+def _batch(seq):
+    # XXX: Replace with itertools.batched
+    n = np.clip(int(len(seq) // (os.cpu_count() or 1)), 1, 300)
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
 def _data_period(index) -> Union[pd.Timedelta, Number]:
     """Return data index period as pd.Timedelta"""
     values = pd.Series(index[-100:])
     return values.diff().dropna().median()
+
+
+def _strategy_indicators(strategy):
+    return {attr: indicator
+            for attr, indicator in strategy.__dict__.items()
+            if isinstance(indicator, _Indicator)}.items()
+
+
+def _indicator_warmup_nbars(strategy):
+    if strategy is None:
+        return 0
+    nbars = max((np.isnan(indicator.astype(float)).argmin(axis=-1).max()
+                 for _, indicator in _strategy_indicators(strategy)
+                 if not indicator._opts['scatter']), default=0)
+    return nbars
 
 
 class _Array(np.ndarray):
@@ -109,7 +162,7 @@ class _Data:
     """
     def __init__(self, df: pd.DataFrame):
         self.__df = df
-        self.__i = len(df)
+        self.__len = len(df)  # Current length
         self.__pip: Optional[float] = None
         self.__cache: Dict[str, _Array] = {}
         self.__arrays: Dict[str, _Array] = {}
@@ -124,8 +177,8 @@ class _Data:
         except KeyError:
             raise AttributeError(f"Column '{item}' not in data") from None
 
-    def _set_length(self, i):
-        self.__i = i
+    def _set_length(self, length):
+        self.__len = length
         self.__cache.clear()
 
     def _update(self):
@@ -136,18 +189,18 @@ class _Data:
         self.__arrays['__index'] = index
 
     def __repr__(self):
-        i = min(self.__i, len(self.__df)) - 1
+        i = min(self.__len, len(self.__df)) - 1
         index = self.__arrays['__index'][i]
         items = ', '.join(f'{k}={v}' for k, v in self.__df.iloc[i].items())
         return f'<Data i={i} ({index}) {items}>'
 
     def __len__(self):
-        return self.__i
+        return self.__len
 
     @property
     def df(self) -> pd.DataFrame:
-        return (self.__df.iloc[:self.__i]
-                if self.__i < len(self.__df)
+        return (self.__df.iloc[:self.__len]
+                if self.__len < len(self.__df)
                 else self.__df)
 
     @property
@@ -160,7 +213,7 @@ class _Data:
     def __get_array(self, key) -> _Array:
         arr = self.__cache.get(key)
         if arr is None:
-            arr = self.__cache[key] = cast(_Array, self.__arrays[key][:self.__i])
+            arr = self.__cache[key] = cast(_Array, self.__arrays[key][:self.__len])
         return arr
 
     @property
@@ -193,3 +246,92 @@ class _Data:
 
     def __setstate__(self, state):
         self.__dict__ = state
+
+
+if sys.version_info >= (3, 13):
+    SharedMemory = _mpshm.SharedMemory
+else:
+    class SharedMemory(_mpshm.SharedMemory):
+        # From https://github.com/python/cpython/issues/82300#issuecomment-2169035092
+        __lock = Lock()
+
+        def __init__(self, *args, track: bool = True, **kwargs):
+            self._track = track
+            if track:
+                return super().__init__(*args, **kwargs)
+            with self.__lock:
+                with patch(_mprt, 'register', lambda *a, **kw: None):
+                    super().__init__(*args, **kwargs)
+
+        def unlink(self):
+            if _mpshm._USE_POSIX and self._name:
+                _mpshm._posixshmem.shm_unlink(self._name)
+                if self._track:
+                    _mprt.unregister(self._name, "shared_memory")
+
+
+class SharedMemoryManager:
+    """
+    A simple shared memory contextmanager based on
+    https://docs.python.org/3/library/multiprocessing.shared_memory.html#multiprocessing.shared_memory.SharedMemory
+    """
+    def __init__(self, create=False) -> None:
+        self._shms: list[SharedMemory] = []
+        self.__create = create
+
+    def SharedMemory(self, *, name=None, create=False, size=0, track=True):
+        shm = SharedMemory(name=name, create=create, size=size, track=track)
+        shm._create = create
+        # Essential to keep refs on Windows
+        # https://stackoverflow.com/questions/74193377/filenotfounderror-when-passing-a-shared-memory-to-a-new-process#comment130999060_74194875  # noqa: E501
+        self._shms.append(shm)
+        return shm
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        for shm in self._shms:
+            try:
+                shm.close()
+                if shm._create:
+                    shm.unlink()
+            except Exception:
+                warnings.warn(f'Failed to unlink shared memory {shm.name!r}',
+                              category=ResourceWarning, stacklevel=2)
+                raise
+
+    def arr2shm(self, vals):
+        """Array to shared memory. Returns (shm_name, shape, dtype) used for restore."""
+        assert vals.ndim == 1, (vals.ndim, vals.shape, vals)
+        shm = self.SharedMemory(size=vals.nbytes, create=True)
+        # np.array can't handle pandas' tz-aware datetimes
+        # https://github.com/numpy/numpy/issues/18279
+        buf = np.ndarray(vals.shape, dtype=vals.dtype.base, buffer=shm.buf)
+        has_tz = getattr(vals.dtype, 'tz', None)
+        buf[:] = vals.tz_localize(None) if has_tz else vals  # Copy into shared memory
+        return shm.name, vals.shape, vals.dtype
+
+    def df2shm(self, df):
+        return tuple((
+            (column, *self.arr2shm(values))
+            for column, values in chain([(self._DF_INDEX_COL, df.index)], df.items())
+        ))
+
+    @staticmethod
+    def shm2s(shm, shape, dtype) -> pd.Series:
+        arr = np.ndarray(shape, dtype=dtype.base, buffer=shm.buf)
+        arr.setflags(write=False)
+        return pd.Series(arr, dtype=dtype)
+
+    _DF_INDEX_COL = '__bt_index'
+
+    @staticmethod
+    def shm2df(data_shm):
+        shm = [SharedMemory(name=name, create=False, track=False) for _, name, _, _ in data_shm]
+        df = pd.DataFrame({
+            col: SharedMemoryManager.shm2s(shm, shape, dtype)
+            for shm, (col, _, shape, dtype) in zip(shm, data_shm)})
+        df.set_index(SharedMemoryManager._DF_INDEX_COL, drop=True, inplace=True)
+        df.index.name = None
+        return df, shm

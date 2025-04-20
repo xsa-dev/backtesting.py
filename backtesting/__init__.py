@@ -1,12 +1,15 @@
 """
 
-![xkcd.com/1570](https://imgs.xkcd.com/comics/engineer_syllogism.png)
+![xkcd.com/1570](https://imgs.xkcd.com/comics/engineer_syllogism.png){: height=263}
 
 ## Manuals
 
 * [**Quick Start User Guide**](../examples/Quick Start User Guide.html)
 
 ## Tutorials
+
+The tutorials encompass most framework features, so it's important
+and advisable to go through all of them. They are short.
 
 * [Library of Utilities and Composable Base Strategies](../examples/Strategies Library.html)
 * [Multiple Time Frames](../examples/Multiple Time Frames.html)
@@ -23,6 +26,11 @@ These tutorials are also available as live Jupyter notebooks:
 urlpath=lab%2Ftree%2Fdoc%2Fexamples%2FQuick%20Start%20User%20Guide.ipynb
 [colab]: https://colab.research.google.com/github/kernc/backtesting.py/
 
+## Video Tutorials
+
+* Some [**coverage on YouTube**](https://github.com/kernc/backtesting.py/discussions/677).
+* [YouTube search](https://www.youtube.com/results?q=%22backtesting.py%22)
+
 ## Example Strategies
 
 * (contributions welcome)
@@ -30,7 +38,7 @@ urlpath=lab%2Ftree%2Fdoc%2Fexamples%2FQuick%20Start%20User%20Guide.ipynb
 
 .. tip::
     For an overview of recent changes, see
-    [What's New](https://github.com/kernc/backtesting.py/blob/master/CHANGELOG.md).
+    [What's New, i.e. the **Change Log**](https://github.com/kernc/backtesting.py/blob/master/CHANGELOG.md).
 
 
 ## FAQ
@@ -60,3 +68,23 @@ except ImportError:
 from . import lib  # noqa: F401
 from ._plotting import set_bokeh_output  # noqa: F401
 from .backtesting import Backtest, Strategy  # noqa: F401
+
+
+# Add overridable backtesting.Pool used for parallel optimization
+def Pool(processes=None, initializer=None, initargs=()):
+    import multiprocessing as mp
+    if mp.get_start_method() == 'spawn':
+        import warnings
+        warnings.warn(
+            "If you want to use multi-process optimization with "
+            "`multiprocessing.get_start_method() == 'spawn'` (e.g. on Windows),"
+            "set `backtesting.Pool = multiprocessing.Pool` (or of the desired context) "
+            "and hide `bt.optimize()` call behind a `if __name__ == '__main__'` guard. "
+            "Currently using thread-based paralellism, "
+            "which might be slightly slower for non-numpy / non-GIL-releasing code. "
+            "See https://github.com/kernc/backtesting.py/issues/1256",
+            category=RuntimeWarning, stacklevel=3)
+        from multiprocessing.dummy import Pool
+        return Pool(processes, initializer, initargs)
+    else:
+        return mp.Pool(processes, initializer, initargs)
